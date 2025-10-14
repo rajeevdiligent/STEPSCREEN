@@ -1,0 +1,180 @@
+{
+  "Comment": "Company Data Extraction and Merge Pipeline",
+  "StartAt": "ParallelExtraction",
+  "States": {
+    "ParallelExtraction": {
+      "Type": "Parallel",
+      "Comment": "Run SEC and CXO extractions in parallel",
+      "Branches": [
+        {
+          "StartAt": "ExtractSECData",
+          "States": {
+            "ExtractSECData": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "NovaSECExtractor",
+                "Payload": {
+                  "company_name.$": "$.company_name",
+                  "stock_symbol.$": "$.stock_symbol"
+                }
+              },
+              "ResultPath": "$.sec_result",
+              "ResultSelector": {
+                "statusCode.$": "$.Payload.statusCode",
+                "body.$": "$.Payload.body"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed",
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.sec_error",
+                  "Next": "SECExtractionFailed"
+                }
+              ],
+              "End": true
+            },
+            "SECExtractionFailed": {
+              "Type": "Pass",
+              "Result": {
+                "status": "failed",
+                "message": "SEC extraction failed"
+              },
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "ExtractCXOData",
+          "States": {
+            "ExtractCXOData": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "CXOWebsiteExtractor",
+                "Payload": {
+                  "website_url.$": "$.website_url",
+                  "company_name.$": "$.company_name"
+                }
+              },
+              "ResultPath": "$.cxo_result",
+              "ResultSelector": {
+                "statusCode.$": "$.Payload.statusCode",
+                "body.$": "$.Payload.body"
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed",
+                    "Lambda.ServiceException",
+                    "Lambda.AWSLambdaException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "IntervalSeconds": 2,
+                  "MaxAttempts": 2,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": ["States.ALL"],
+                  "ResultPath": "$.cxo_error",
+                  "Next": "CXOExtractionFailed"
+                }
+              ],
+              "End": true
+            },
+            "CXOExtractionFailed": {
+              "Type": "Pass",
+              "Result": {
+                "status": "failed",
+                "message": "CXO extraction failed"
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "ResultPath": "$.extraction_results",
+      "Next": "CheckExtractionResults"
+    },
+    "CheckExtractionResults": {
+      "Type": "Choice",
+      "Comment": "Check if both extractions succeeded",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.extraction_results[0].sec_result.statusCode",
+              "NumericEquals": 200
+            },
+            {
+              "Variable": "$.extraction_results[1].cxo_result.statusCode",
+              "NumericEquals": 200
+            }
+          ],
+          "Next": "MergeAndSaveToS3"
+        }
+      ],
+      "Default": "ExtractionFailed"
+    },
+    "MergeAndSaveToS3": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Merge SEC and CXO data and save to S3",
+      "Parameters": {
+        "FunctionName": "DynamoDBToS3Merger",
+        "Payload": {
+          "s3_bucket_name": "company-sec-cxo-data-diligent",
+          "company_name.$": "$.company_name"
+        }
+      },
+      "ResultSelector": {
+        "statusCode.$": "$.Payload.statusCode",
+        "body.$": "$.Payload.body"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException"
+          ],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 2,
+          "BackoffRate": 2
+        }
+      ],
+      "Next": "PipelineSuccess"
+    },
+    "PipelineSuccess": {
+      "Type": "Pass",
+      "Comment": "Pipeline completed successfully",
+      "Result": {
+        "status": "success",
+        "message": "Company data extraction and merge completed successfully"
+      },
+      "End": true
+    },
+    "ExtractionFailed": {
+      "Type": "Fail",
+      "Comment": "One or both extractions failed",
+      "Error": "ExtractionError",
+      "Cause": "SEC or CXO extraction failed. Check extraction_results for details."
+    }
+  }
+}
+
