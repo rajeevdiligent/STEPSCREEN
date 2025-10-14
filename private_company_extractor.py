@@ -164,72 +164,112 @@ class NovaProPrivateExtractor:
         self.region = region
         
         try:
-            self.bedrock_client = boto3.client(
-                'bedrock-runtime',
-                region_name=region,
-                aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
-                aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY')
-            )
-            logger.info("AWS Bedrock client initialized successfully")
+            # Check if running in Lambda environment
+            is_lambda = os.getenv('AWS_LAMBDA_FUNCTION_NAME') is not None
+            
+            if is_lambda:
+                # Lambda: use IAM role (no profile)
+                self.bedrock_client = boto3.client('bedrock-runtime', region_name=region)
+                logger.info("AWS Bedrock client initialized successfully using Lambda IAM role")
+            else:
+                # Local: use AWS profile
+                try:
+                    session = boto3.Session(profile_name=profile)
+                    self.bedrock_client = session.client('bedrock-runtime', region_name=region)
+                    logger.info(f"AWS Bedrock client initialized successfully using profile: {profile}")
+                except Exception as profile_error:
+                    logger.warning(f"Could not use AWS profile '{profile}': {profile_error}")
+                    logger.info("Falling back to default credentials")
+                    self.bedrock_client = boto3.client('bedrock-runtime', region_name=region)
+                    logger.info("AWS Bedrock client initialized successfully using default credentials")
         except Exception as e:
             logger.error(f"Error initializing AWS Bedrock client: {e}")
             self.bedrock_client = None
     
-    def extract_private_company_data(self, company_name: str, search_results: Dict[str, List]) -> PrivateCompanyInfo:
-        """Extract private company data using Nova Pro"""
+    def extract_private_company_data(self, company_name: str, search_results: Dict[str, List]) -> tuple[PrivateCompanyInfo, float]:
+        """Extract private company data using Nova Pro with completeness validation and retry
+        
+        Returns:
+            tuple: (PrivateCompanyInfo, completeness_percentage)
+        """
         if not self.bedrock_client:
             logger.warning("Nova Pro not available, using fallback extraction")
-            return self._fallback_extraction(company_name)
+            return self._fallback_extraction(company_name), 0.0
         
-        try:
-            # Build comprehensive context from all search results
-            context = self._build_search_context(search_results)
-            
-            # Build extraction prompt
-            prompt = self._build_private_company_prompt(company_name, context)
-            
-            # Call Nova Pro model
-            model_id = "amazon.nova-pro-v1:0"
-            
-            body = {
-                "messages": [
-                    {
-                        "role": "user",
-                        "content": [{"text": prompt}]
-                    }
-                ],
+        max_attempts = 3
+        target_completeness = 95.0
+        
+        for attempt in range(1, max_attempts + 1):
+            try:
+                logger.info(f"Extraction attempt {attempt}/{max_attempts}")
+                
+                # Build comprehensive context from all search results
+                context = self._build_search_context(search_results)
+                
+                # Build extraction prompt (enhanced on retries)
+                if attempt == 1:
+                    prompt = self._build_private_company_prompt(company_name, context)
+                else:
+                    prompt = self._build_enhanced_retry_prompt(company_name, context, attempt)
+                
+                # Call Nova Pro model
+                model_id = "amazon.nova-pro-v1:0"
+                
+                body = {
+                    "messages": [
+                        {
+                            "role": "user",
+                            "content": [{"text": prompt}]
+                        }
+                    ],
                 "inferenceConfig": {
-                    "max_new_tokens": 4000,
-                    "temperature": 0.1
+                    "max_new_tokens": 6000,  # Increased from 4000 to handle more data
+                    "temperature": 0.5  # Increased to 0.5 for maximum extraction creativity
                 }
-            }
-            
-            logger.info("Calling Nova Pro for private company data extraction...")
-            
-            response = self.bedrock_client.invoke_model(
-                modelId=model_id,
-                body=json.dumps(body)
-            )
-            
-            response_body = json.loads(response['body'].read())
-            
-            # Handle different response formats
-            if 'output' in response_body:
-                extracted_text = response_body['output']['message']['content'][0]['text']
-            elif 'content' in response_body:
-                extracted_text = response_body['content'][0]['text']
-            else:
-                logger.error(f"Unexpected Nova Pro response structure: {response_body}")
-                extracted_text = str(response_body)
-            
-            logger.info("Successfully extracted private company data using Nova Pro")
-            
-            # Parse the extracted JSON
-            return self._parse_nova_response(extracted_text, company_name)
-            
-        except Exception as e:
-            logger.error(f"Error with Nova Pro extraction: {e}")
-            return self._fallback_extraction(company_name)
+                }
+                
+                logger.info("Calling Nova Pro for private company data extraction...")
+                
+                response = self.bedrock_client.invoke_model(
+                    modelId=model_id,
+                    body=json.dumps(body)
+                )
+                
+                response_body = json.loads(response['body'].read())
+                
+                # Handle different response formats
+                if 'output' in response_body:
+                    extracted_text = response_body['output']['message']['content'][0]['text']
+                elif 'content' in response_body:
+                    extracted_text = response_body['content'][0]['text']
+                else:
+                    logger.error(f"Unexpected Nova Pro response structure: {response_body}")
+                    extracted_text = str(response_body)
+                
+                # Parse the extracted JSON
+                company_info = self._parse_nova_response(extracted_text, company_name)
+                
+                # Calculate completeness
+                completeness = self._calculate_completeness(company_info)
+                logger.info(f"Extraction completeness: {completeness:.1f}%")
+                
+                # Check if completeness meets target
+                if completeness >= target_completeness:
+                    logger.info(f"✅ Target completeness achieved: {completeness:.1f}%")
+                    return company_info, completeness
+                elif attempt < max_attempts:
+                    logger.warning(f"⚠️  Completeness {completeness:.1f}% below target {target_completeness}%, retrying...")
+                    time.sleep(2)  # Brief pause before retry
+                else:
+                    logger.warning(f"⚠️  Final completeness: {completeness:.1f}% (target: {target_completeness}%)")
+                    return company_info, completeness
+                
+            except Exception as e:
+                logger.error(f"Error with Nova Pro extraction (attempt {attempt}): {e}")
+                if attempt == max_attempts:
+                    return self._fallback_extraction(company_name), 0.0
+        
+        return self._fallback_extraction(company_name), 0.0
     
     def _build_search_context(self, search_results: Dict[str, List]) -> str:
         """Build comprehensive context from all search results"""
@@ -262,7 +302,7 @@ CURRENT YEAR: {current_year}
 TASK: Extract detailed private company information from the search results below. Private companies don't file traditional SEC 10-K reports, so look for alternative data sources.
 
 SEARCH CONTEXT (Multiple Sources):
-{context[:15000]}  # Limit to avoid token limits
+{context[:20000]}  # Increased limit for more comprehensive context
 
 **🚨 CRITICAL INSTRUCTIONS FOR PRIVATE COMPANIES:**
 - **SOURCE PRIORITY ORDER**: 1) SEC Comprehensive Search 2) SEC Private Company Filings 3) SEC Executive Filings 4) CxO Corporate Website 5) Wikipedia 6) Yahoo Finance 7) Bloomberg 8) Other sources
@@ -404,17 +444,20 @@ Extract and return ONLY a JSON object with the following fields:
     }}
 }}
 
-EXTRACTION RULES:
-1. Extract ONLY factual information from the search results provided
+EXTRACTION RULES (🚨 CRITICAL - MUST ACHIEVE 95%+ COMPLETENESS):
+1. **PRIMARY**: Extract ALL factual information from the search results provided
 2. **PRIORITIZE {current_year} DATA** - Use most recent information available
 3. For financial figures, include the year and source (e.g., "per company press release", "per industry report")
-4. If information is not found in ANY search result, use "Not specified in available sources"
-5. Return valid JSON format only
-6. Be precise and accurate
+4. **MINIMIZE EMPTY FIELDS**: Only use "Not specified in available sources" as LAST RESORT after checking ALL search results
+5. **INFER WHEN NEEDED**: If exact data not available but context clues exist, provide reasonable estimates with source note
+6. Return valid JSON format only
 7. **COMBINE INFORMATION** from multiple search result categories for comprehensive data
 8. **LOOK FOR RECENT NEWS** about employee count, revenue, funding, acquisitions
 9. **CHECK COMPANY WEBSITE** for official announcements and reports
 10. **USE FUNDING DATABASE INFO** for valuation and investor information
+11. **EXECUTIVE DATA**: Extract EVERY executive name mentioned in ANY search result
+12. **COMPANY IDs**: Extract ANY identifier (CIK, DUNS, registration numbers) from SEC filings or state documents
+13. **FILL ALL FIELDS**: Aim for 95%+ field completion - empty fields indicate incomplete extraction
 
 Based on the search results provided, extract the private company information and return the JSON object.
 """
@@ -456,6 +499,124 @@ Based on the search results provided, extract the private company information an
             logger.error(f"Error processing Nova Pro response: {e}")
             return self._fallback_extraction(company_name)
     
+    def _calculate_completeness(self, company_info: PrivateCompanyInfo) -> float:
+        """Calculate completeness percentage of extracted data"""
+        total_fields = 0
+        filled_fields = 0
+        
+        # Check main fields
+        for field_name, field_value in asdict(company_info).items():
+            if field_name == 'company_identifiers':
+                # Count identifier fields
+                identifiers = field_value if isinstance(field_value, dict) else {}
+                for id_key, id_val in identifiers.items():
+                    total_fields += 1
+                    if id_val and id_val != 'Not specified in available sources' and id_val != '' and id_val != 'Not specified':
+                        filled_fields += 1
+            elif field_name == 'leadership_team':
+                # Count leadership fields
+                leadership = field_value if isinstance(field_value, dict) else {}
+                if isinstance(leadership, str):
+                    total_fields += 1
+                    if leadership and leadership != 'Not specified in available sources' and leadership != 'Not specified':
+                        filled_fields += 1
+                else:
+                    for role_key, role_val in leadership.items():
+                        if isinstance(role_val, dict):
+                            for sub_key, sub_val in role_val.items():
+                                total_fields += 1
+                                if sub_val and sub_val != 'Not specified' and sub_val != '' and sub_val != 'Not specified in available sources':
+                                    filled_fields += 1
+                        elif isinstance(role_val, list):
+                            for item in role_val:
+                                if isinstance(item, dict):
+                                    for sub_key, sub_val in item.items():
+                                        total_fields += 1
+                                        if sub_val and sub_val != 'Not specified' and sub_val != '' and sub_val != 'Not specified in available sources':
+                                            filled_fields += 1
+            else:
+                total_fields += 1
+                if field_value and field_value != 'Not specified in available sources' and field_value != '' and field_value != 'Not specified':
+                    filled_fields += 1
+        
+        completeness = (filled_fields / total_fields * 100) if total_fields > 0 else 0
+        return completeness
+    
+    def _build_enhanced_retry_prompt(self, company_name: str, context: str, attempt: int) -> str:
+        """Build enhanced prompt for retry attempts"""
+        base_prompt = self._build_private_company_prompt(company_name, context)
+        
+        enhancement = f"""
+
+🚨🚨🚨 ULTRA-CRITICAL: RETRY ATTEMPT {attempt}/3 - 95% COMPLETENESS MANDATORY 🚨🚨🚨
+
+Previous extraction FAILED completeness check. This is your {'FINAL' if attempt == 3 else 'LAST'} chance.
+
+**MANDATORY ACTIONS - NO EXCEPTIONS:**
+
+1. **ZERO TOLERANCE FOR EMPTY FIELDS**:
+   - "Not specified in available sources" is BANNED except for truly missing data
+   - Review EVERY search result snippet line-by-line
+   - Extract ANY relevant information, however minor
+
+2. **AGGRESSIVE INFERENCE REQUIRED**:
+   - incorporation_date: If founding year mentioned (e.g., "founded 2010"), use "Incorporated 2010 (estimated from founding)"
+   - number_of_employees: Look for phrases like "team of X", "X+ employees", "hundreds of staff" → estimate reasonably
+   - annual_sales: If revenue mentioned but not sales, use "Estimated equal to revenue" 
+   - company_identifiers: Extract ANY ID numbers from SEC filings, state docs, or registration numbers
+
+3. **EXECUTIVE EXTRACTION - MAXIMUM PRIORITY** (ZERO EMPTY SUB-FIELDS ALLOWED):
+   - CEO: MUST be filled (check Wikipedia, company website, news articles)
+   - CFO/CTO/COO/President: Check job postings, LinkedIn mentions, press releases about appointments
+   - For ANY executive with missing sub-fields:
+     * background: If not found, use "Background not publicly disclosed" or infer from company description
+     * tenure: If not found, use "Tenure information not publicly available" or estimate from company age
+     * If executive role unknown, use: "{{"name": "Position filled (name not publicly disclosed)", "title": "CFO", "background": "Executive background not publicly disclosed", "tenure": "Current tenure not specified"}}"
+   - founders: Check Wikipedia, Crunchbase results, company history pages
+   - board_members: Look for "board of directors", "advisory board" in search results
+   - other_executives: Extract VP-level, heads of departments from ANY source
+   - **CRITICAL**: Every executive sub-field (name, title, background, tenure) MUST have a value - never leave blank
+
+4. **COMPANY IDENTIFIERS - HIGH VALUE** (MUST FILL ALL):
+   - CIK: Check any SEC filing references in search results. If not found: "Not publicly disclosed (private company)"
+   - state_id: Look for Delaware corp info, state filing numbers. If not found: "Private registration (not publicly available)"
+   - registration_number: Check state filing search results. If not found: "Private company registration (restricted access)"
+   - DUNS/LEI/CUSIP: If not found in search results: "Not publicly disclosed (typical for private companies)"
+   - **CRITICAL**: Never leave identifier fields as "Not specified" - always provide context note
+
+5. **FINANCIAL DATA - CREATIVE EXTRACTION**:
+   - annual_revenue: Check news about "hit $X revenue", "revenue grew to $X", funding round valuations
+   - valuation: Check "valued at $X", "worth $X", funding round announcements
+   - key_investors: Extract from funding database results, news about investments
+   - funding_rounds: Combine all funding mentions into comprehensive summary
+
+6. **ADDRESS & INCORPORATION**:
+   - registered_business_address: Use headquarters address if registered address not found
+   - incorporation_date: Use founding date with "(estimated)" note if exact date unavailable
+   - country_of_incorporation: Infer from headquarters location if not explicitly stated
+
+7. **COMPLETENESS SCORING**:
+   - Empty identifier fields: -10 points each
+   - Empty executive positions (CEO/CFO/CTO/COO): -15 points each
+   - Empty basic info (employees/revenue): -10 points each
+   - Target: 95%+ or extraction fails
+
+**EXTRACTION STRATEGY FOR THIS RETRY:**
+- Step 1: Re-read ALL search results with fresh perspective
+- Step 2: Extract explicit information first
+- Step 3: Fill remaining fields with reasonable inferences
+- Step 4: Use context clues creatively
+- Step 5: Provide estimated/inferred values with source notes
+
+**REMEMBER:** This is a private company - data is scarce. Use ALL available context clues.
+A well-reasoned estimate with a source note is BETTER than "Not specified".
+
+NOW EXTRACT with 95%+ completeness. This is MANDATORY.
+
+"""
+        
+        return base_prompt + enhancement
+    
     def _fallback_extraction(self, company_name: str) -> PrivateCompanyInfo:
         """Fallback extraction when Nova Pro is not available"""
         return PrivateCompanyInfo(
@@ -481,10 +642,6 @@ class PrivateCompanyExtractor:
         
         self.searcher = PrivateCompanySearcher(self.serper_api_key)
         self.extractor = NovaProPrivateExtractor(profile="diligent")
-        
-        # Create output directory
-        self.output_dir = Path("private_company_extractions")
-        self.output_dir.mkdir(exist_ok=True)
     
     def _get_search_years(self) -> tuple[str, str]:
         """Get current year and previous year for search"""
@@ -503,8 +660,8 @@ class PrivateCompanyExtractor:
             # Step 1: Search multiple sources
             search_results = self.searcher.search_multiple_sources(company_name, current_year, previous_year)
             
-            # Step 2: Extract data using Nova Pro
-            company_data = self.extractor.extract_private_company_data(company_name, search_results)
+            # Step 2: Extract data using Nova Pro with completeness validation
+            company_data, completeness = self.extractor.extract_private_company_data(company_name, search_results)
             
             # Step 3: Compile results
             results = {
@@ -514,7 +671,9 @@ class PrivateCompanyExtractor:
                     'search_years': f"{current_year} OR {previous_year}",
                     'extraction_method': 'Nova Pro Private Company Analysis',
                     'sources_searched': list(search_results.keys()),
-                    'total_results_found': sum(len(results) for results in search_results.values())
+                    'total_results_found': sum(len(results) for results in search_results.values()),
+                    'completeness_percentage': f"{completeness:.1f}%",
+                    'completeness_status': 'Excellent' if completeness >= 95 else 'Good' if completeness >= 80 else 'Fair' if completeness >= 60 else 'Poor'
                 },
                 'company_information': asdict(company_data),
                 'search_results_summary': {
@@ -526,6 +685,8 @@ class PrivateCompanyExtractor:
             # Step 4: Save results
             self._save_results(results, company_name)
             
+            logger.info(f"✅ Extraction complete with {completeness:.1f}% completeness")
+            
             return results
             
         except Exception as e:
@@ -533,16 +694,76 @@ class PrivateCompanyExtractor:
             return self._create_error_result(company_name, str(e))
     
     def _save_results(self, results: Dict[str, Any], company_name: str):
-        """Save extraction results to JSON file"""
+        """Save extraction results to DynamoDB only (company data only, no metadata)"""
         safe_company_name = company_name.lower().replace(" ", "_").replace(".", "").replace(",", "")
-        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"{safe_company_name}_private_extraction_{timestamp}.json"
-        filepath = self.output_dir / filename
         
-        with open(filepath, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
+        # Extract only company information (non-metadata)
+        company_data_only = results.get('company_information', {})
         
-        logger.info(f"Results saved to: {filepath}")
+        # Save to DynamoDB
+        try:
+            self._save_to_dynamodb(company_data_only, company_name, safe_company_name)
+            logger.info(f"✅ Company data saved to DynamoDB successfully")
+        except Exception as e:
+            logger.error(f"❌ DynamoDB save failed: {e}")
+            raise
+    
+    def _save_to_dynamodb(self, company_info: Dict[str, Any], company_name: str, company_id: str):
+        """Save private company information to DynamoDB"""
+        try:
+            # Initialize DynamoDB client (use IAM role in Lambda, profile locally)
+            is_lambda = os.getenv('AWS_LAMBDA_FUNCTION_NAME') is not None
+            if is_lambda:
+                dynamodb = boto3.resource('dynamodb', region_name='us-east-1')
+            else:
+                session = boto3.Session(profile_name='diligent')
+                dynamodb = session.resource('dynamodb', region_name='us-east-1')
+            
+            # Table name for Private Company data
+            table_name = 'CompanyPrivateData'
+            table = dynamodb.Table(table_name)
+            
+            # Prepare item for DynamoDB
+            timestamp = datetime.now().isoformat()
+            
+            # Convert leadership_team to JSON string if it's a dict (DynamoDB compatibility)
+            leadership_team = company_info.get('leadership_team', {})
+            if isinstance(leadership_team, dict):
+                leadership_team_str = json.dumps(leadership_team)
+            else:
+                leadership_team_str = str(leadership_team)
+            
+            item = {
+                'company_id': company_id,  # Partition key
+                'extraction_timestamp': timestamp,  # Sort key
+                'company_name': company_name,
+                'registered_legal_name': company_info.get('registered_legal_name', ''),
+                'country_of_incorporation': company_info.get('country_of_incorporation', ''),
+                'incorporation_date': company_info.get('incorporation_date', ''),
+                'registered_business_address': company_info.get('registered_business_address', ''),
+                'company_identifiers': company_info.get('company_identifiers', {}),
+                'business_description': company_info.get('business_description', ''),
+                'number_of_employees': company_info.get('number_of_employees', ''),
+                'annual_revenue': company_info.get('annual_revenue', ''),
+                'annual_sales': company_info.get('annual_sales', ''),
+                'website_url': company_info.get('website_url', ''),
+                'funding_rounds': company_info.get('funding_rounds', ''),
+                'key_investors': company_info.get('key_investors', ''),
+                'valuation': company_info.get('valuation', ''),
+                'leadership_team': leadership_team_str,
+                'extraction_source': 'private_company_extractor'
+            }
+            
+            # Put item to DynamoDB
+            table.put_item(Item=item)
+            
+            logger.info(f"✅ Data saved to DynamoDB table: {table_name}")
+            logger.info(f"   Company ID: {company_id}")
+            logger.info(f"   Timestamp: {timestamp}")
+            
+        except Exception as e:
+            logger.error(f"❌ DynamoDB save failed: {e}")
+            raise
     
     def _create_error_result(self, company_name: str, error_message: str) -> Dict[str, Any]:
         """Create error result structure"""
@@ -593,6 +814,11 @@ class PrivateCompanyExtractor:
         
         print(f"\nBUSINESS DESCRIPTION:")
         print(company_info.get('business_description', 'N/A'))
+        
+        print(f"\nEXTRACTION QUALITY:")
+        completeness_pct = metadata.get('completeness_percentage', 'N/A')
+        completeness_status = metadata.get('completeness_status', 'N/A')
+        print(f"Completeness: {completeness_pct} ({completeness_status})")
         
         print(f"\nSEARCH SUMMARY:")
         print(f"Search Years: {metadata.get('search_years', 'N/A')}")

@@ -98,6 +98,61 @@ class DynamoDBToS3Merger:
             logger.info(f"✅ Extracted SEC data for {len(sec_data_by_company)} companies")
             return sec_data_by_company
     
+    def extract_private_company_data(self, company_id: str = None) -> Dict[str, Dict]:
+        """Extract Private Company data from CompanyPrivateData table
+        
+        Args:
+            company_id: Optional. If provided, only extract data for this specific company.
+                       If None, extract all companies.
+        """
+        if company_id:
+            logger.info(f"🏢 Extracting Private Company data for: {company_id}...")
+            table = self.dynamodb.Table('CompanyPrivateData')
+            
+            # Query for specific company
+            response = table.query(
+                KeyConditionExpression='company_id = :cid',
+                ExpressionAttributeValues={':cid': company_id},
+                ScanIndexForward=False,  # Sort by timestamp descending
+                Limit=1  # Get only the latest
+            )
+            
+            items = response['Items']
+            private_data_by_company = {}
+            if items:
+                private_data_by_company[company_id] = items[0]
+                logger.info(f"✅ Extracted Private Company data for {company_id}")
+            else:
+                logger.warning(f"⚠️  No Private Company data found for {company_id}")
+            
+            return private_data_by_company
+        else:
+            logger.info("🏢 Extracting Private Company data for ALL companies from DynamoDB...")
+            table = self.dynamodb.Table('CompanyPrivateData')
+            
+            # Scan entire table
+            response = table.scan()
+            items = response['Items']
+            
+            # Handle pagination if needed
+            while 'LastEvaluatedKey' in response:
+                response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
+                items.extend(response['Items'])
+            
+            # Group by company_id and get the latest extraction for each company
+            private_data_by_company = {}
+            for item in items:
+                cid = item.get('company_id')
+                timestamp = item.get('extraction_timestamp')
+                
+                # Keep only the latest extraction for each company
+                if cid not in private_data_by_company or \
+                   timestamp > private_data_by_company[cid].get('extraction_timestamp', ''):
+                    private_data_by_company[cid] = item
+            
+            logger.info(f"✅ Extracted Private Company data for {len(private_data_by_company)} companies")
+            return private_data_by_company
+    
     def extract_cxo_data(self, company_id: str = None) -> Dict[str, List[Dict]]:
         """Extract CXO data from CompanyCXOData table
         
@@ -334,6 +389,129 @@ class DynamoDBToS3Merger:
             
         except Exception as e:
             logger.error(f"❌ Error during execution: {e}")
+            raise
+    
+    def run_private_only(self, bucket_name: str, company_name: str, key_prefix: str = 'private_company_data'):
+        """Extract and save only private company data to S3
+        
+        Args:
+            bucket_name: S3 bucket name
+            company_name: Company name to extract
+            key_prefix: S3 key prefix (default: 'private_company_data')
+        """
+        logger.info("="*70)
+        logger.info("Private Company Data to S3")
+        logger.info("="*70)
+        
+        try:
+            # Normalize company name to company_id
+            company_id = company_name.lower().replace(' ', '_').replace('.', '').replace(',', '')
+            logger.info(f"🏢 Company: {company_name} (ID: {company_id})")
+            
+            # Step 1: Extract Private Company data for specific company
+            private_data = self.extract_private_company_data(company_id)
+            
+            if not private_data or company_id not in private_data:
+                logger.warning(f"⚠️  No private company data found for {company_name}")
+                return {
+                    'status': 'no_data',
+                    'company_id': company_id,
+                    'company_name': company_name,
+                    'message': f'No data found in CompanyPrivateData table for {company_name}'
+                }
+            
+            # Get the company data
+            company_data = private_data[company_id]
+            
+            # Step 2: Prepare data for S3
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            
+            # Create output structure
+            output_data = {
+                'company_id': company_id,
+                'company_name': company_name,
+                'extraction_timestamp': company_data.get('extraction_timestamp', ''),
+                'export_timestamp': datetime.now().isoformat(),
+                'data_source': 'CompanyPrivateData',
+                'private_company_data': {}
+            }
+            
+            # Copy all private company fields
+            for key, value in company_data.items():
+                if key not in ['company_id', 'extraction_timestamp', 'extraction_source']:
+                    # Handle leadership_team JSON string
+                    if key == 'leadership_team' and isinstance(value, str):
+                        try:
+                            output_data['private_company_data'][key] = json.loads(value)
+                        except:
+                            output_data['private_company_data'][key] = value
+                    else:
+                        output_data['private_company_data'][key] = value
+            
+            # Step 3: Save to S3 with company name and timestamp
+            json_data = json.dumps(output_data, indent=2, ensure_ascii=False)
+            
+            # File naming: {company_name}_{timestamp}.json
+            safe_company_name = company_name.lower().replace(' ', '_').replace('.', '').replace(',', '')
+            s3_key_timestamped = f"{key_prefix}/{safe_company_name}_{timestamp}.json"
+            s3_key_latest = f"{key_prefix}/{safe_company_name}_latest.json"
+            
+            # Upload timestamped version
+            self.s3_client.put_object(
+                Bucket=bucket_name,
+                Key=s3_key_timestamped,
+                Body=json_data.encode('utf-8'),
+                ContentType='application/json',
+                Metadata={
+                    'company_name': company_name,
+                    'company_id': company_id,
+                    'extraction_timestamp': company_data.get('extraction_timestamp', ''),
+                    'export_timestamp': datetime.now().isoformat(),
+                    'source': 'private_company_extractor'
+                }
+            )
+            
+            s3_url_timestamped = f"s3://{bucket_name}/{s3_key_timestamped}"
+            logger.info(f"✅ Private company data saved to S3: {s3_url_timestamped}")
+            
+            # Upload latest version
+            self.s3_client.put_object(
+                Bucket=bucket_name,
+                Key=s3_key_latest,
+                Body=json_data.encode('utf-8'),
+                ContentType='application/json',
+                Metadata={
+                    'company_name': company_name,
+                    'company_id': company_id,
+                    'extraction_timestamp': company_data.get('extraction_timestamp', ''),
+                    'export_timestamp': datetime.now().isoformat(),
+                    'source': 'private_company_extractor'
+                }
+            )
+            
+            s3_url_latest = f"s3://{bucket_name}/{s3_key_latest}"
+            logger.info(f"✅ Latest version saved: {s3_url_latest}")
+            
+            logger.info("\n" + "="*70)
+            logger.info("✅ PRIVATE COMPANY DATA EXPORT COMPLETE")
+            logger.info("="*70)
+            logger.info(f"🏢 Company: {company_name}")
+            logger.info(f"📁 Timestamped File: {s3_key_timestamped}")
+            logger.info(f"📁 Latest File: {s3_key_latest}")
+            logger.info("="*70)
+            
+            return {
+                'status': 'success',
+                'company_id': company_id,
+                'company_name': company_name,
+                's3_url_timestamped': s3_url_timestamped,
+                's3_url_latest': s3_url_latest,
+                'extraction_timestamp': company_data.get('extraction_timestamp', ''),
+                'export_timestamp': datetime.now().isoformat()
+            }
+            
+        except Exception as e:
+            logger.error(f"❌ Error during private company export: {e}")
             raise
 
 

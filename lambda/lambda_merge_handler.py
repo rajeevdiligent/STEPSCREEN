@@ -24,6 +24,7 @@ class DynamoDBS3Merger:
         
         self.sec_table_name = 'CompanySECData'
         self.cxo_table_name = 'CompanyCXOData'
+        self.private_table_name = 'CompanyPrivateData'
 
     def _scan_table(self, table_name: str) -> list:
         """Scans a DynamoDB table and returns all items."""
@@ -172,6 +173,120 @@ class DynamoDBS3Merger:
             'latest_file': f"s3://{self.s3_bucket_name}/{latest_key}",
             'timestamp': timestamp
         }
+    
+    def run_private_only(self, company_name: str):
+        """Extract and save only private company data to S3
+        
+        Args:
+            company_name: Company name to extract
+        """
+        logger.info("======================================================================")
+        logger.info("PRIVATE COMPANY DATA TO S3")
+        logger.info("======================================================================")
+        
+        # Normalize company name to company_id
+        company_id = company_name.lower().replace(' ', '_').replace('.', '').replace(',', '')
+        logger.info(f"🏢 Company: {company_name} (ID: {company_id})")
+        
+        # Extract private company data
+        private_data = self._query_by_company_id(self.private_table_name, company_id)
+        
+        if not private_data:
+            logger.warning(f"⚠️  No private company data found for {company_name}")
+            return {
+                'status': 'no_data',
+                'company_id': company_id,
+                'company_name': company_name,
+                'message': f'No data found in CompanyPrivateData table for {company_name}'
+            }
+        
+        # Get the most recent data
+        company_data = max(private_data, key=lambda x: x['extraction_timestamp'])
+        
+        # Prepare output data
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        
+        output_data = {
+            'company_id': company_id,
+            'company_name': company_name,
+            'extraction_timestamp': company_data.get('extraction_timestamp', ''),
+            'export_timestamp': datetime.now().isoformat(),
+            'data_source': 'CompanyPrivateData',
+            'private_company_data': {}
+        }
+        
+        # Copy all private company fields
+        for key, value in company_data.items():
+            if key not in ['company_id', 'extraction_timestamp', 'extraction_source']:
+                # Handle leadership_team JSON string
+                if key == 'leadership_team' and isinstance(value, str):
+                    try:
+                        output_data['private_company_data'][key] = json.loads(value)
+                    except:
+                        output_data['private_company_data'][key] = value
+                else:
+                    output_data['private_company_data'][key] = value
+        
+        # Save to S3
+        json_data = json.dumps(output_data, indent=2, ensure_ascii=False)
+        
+        # File naming: private_company_data/{company_name}_{timestamp}.json
+        safe_company_name = company_name.lower().replace(' ', '_').replace('.', '').replace(',', '')
+        key_prefix = 'private_company_data'
+        s3_key_timestamped = f"{key_prefix}/{safe_company_name}_{timestamp}.json"
+        s3_key_latest = f"{key_prefix}/{safe_company_name}_latest.json"
+        
+        # Upload timestamped version
+        self.s3_client.put_object(
+            Bucket=self.s3_bucket_name,
+            Key=s3_key_timestamped,
+            Body=json_data.encode('utf-8'),
+            ContentType='application/json',
+            Metadata={
+                'company_name': company_name,
+                'company_id': company_id,
+                'extraction_timestamp': company_data.get('extraction_timestamp', ''),
+                'export_timestamp': datetime.now().isoformat(),
+                'source': 'private_company_extractor'
+            }
+        )
+        
+        logger.info(f"✅ Private company data saved: s3://{self.s3_bucket_name}/{s3_key_timestamped}")
+        
+        # Upload latest version
+        self.s3_client.put_object(
+            Bucket=self.s3_bucket_name,
+            Key=s3_key_latest,
+            Body=json_data.encode('utf-8'),
+            ContentType='application/json',
+            Metadata={
+                'company_name': company_name,
+                'company_id': company_id,
+                'extraction_timestamp': company_data.get('extraction_timestamp', ''),
+                'export_timestamp': datetime.now().isoformat(),
+                'source': 'private_company_extractor'
+            }
+        )
+        
+        logger.info(f"✅ Latest version saved: s3://{self.s3_bucket_name}/{s3_key_latest}")
+        
+        logger.info("======================================================================")
+        logger.info("✅ PRIVATE COMPANY DATA EXPORT COMPLETE")
+        logger.info("======================================================================")
+        logger.info(f"🏢 Company: {company_name}")
+        logger.info(f"📁 Timestamped File: {s3_key_timestamped}")
+        logger.info(f"📁 Latest File: {s3_key_latest}")
+        logger.info("======================================================================")
+        
+        return {
+            'status': 'success',
+            'company_id': company_id,
+            'company_name': company_name,
+            's3_url_timestamped': f"s3://{self.s3_bucket_name}/{s3_key_timestamped}",
+            's3_url_latest': f"s3://{self.s3_bucket_name}/{s3_key_latest}",
+            'extraction_timestamp': company_data.get('extraction_timestamp', ''),
+            'export_timestamp': datetime.now().isoformat()
+        }
 
 
 def lambda_handler(event, context):
@@ -179,9 +294,17 @@ def lambda_handler(event, context):
     AWS Lambda handler for DynamoDB to S3 merger
     
     Event format:
+    Standard Merge (SEC + CXO):
     {
         "s3_bucket_name": "company-sec-cxo-data-diligent",
         "company_name": "Apple Inc" (optional - if provided, only merge this company)
+    }
+    
+    Private Company Only:
+    {
+        "s3_bucket_name": "company-sec-cxo-data-diligent",
+        "company_name": "SpaceX",
+        "private_only": true
     }
     
     Returns:
@@ -212,32 +335,73 @@ def lambda_handler(event, context):
                 })
             }
         
-        # Get company_name if provided and convert to company_id format
+        # Check if private_only mode
+        private_only = event.get('private_only', False)
         company_name = event.get('company_name')
-        company_id = None
-        if company_name:
-            # Convert to company_id format (same normalization as extractors)
-            company_id = company_name.lower().replace(' ', '_').replace('.', '').replace(',', '')
-            logger.info(f"Starting merge for specific company: {company_name} (ID: {company_id})")
-        else:
-            logger.info(f"Starting merge for ALL companies in S3 bucket: {s3_bucket_name}")
         
         # Initialize merger
         merger = DynamoDBS3Merger(s3_bucket_name)
         
-        # Run merge and save (with optional company_id filter)
-        result = merger.run(company_id)
-        
-        # Prepare response
-        response_body = {
-            'merge_status': 'success',
-            'total_companies': result['total_companies'],
-            'data_file': result['data_file'],
-            'latest_file': result['latest_file'],
-            'timestamp': result['timestamp']
-        }
-        
-        logger.info(f"✅ Merge completed: {result['total_companies']} companies")
+        if private_only:
+            # Private company only mode
+            if not company_name:
+                return {
+                    'statusCode': 400,
+                    'body': json.dumps({
+                        'error': 'Missing required parameter: company_name',
+                        'message': 'company_name is required for private_only mode'
+                    })
+                }
+            
+            logger.info(f"🏢 Starting PRIVATE ONLY export for: {company_name}")
+            result = merger.run_private_only(company_name)
+            
+            if result['status'] == 'no_data':
+                return {
+                    'statusCode': 404,
+                    'body': json.dumps({
+                        'error': 'No data found',
+                        'message': result['message'],
+                        'company_name': company_name
+                    })
+                }
+            
+            # Prepare response
+            response_body = {
+                'export_status': 'success',
+                'company_name': result['company_name'],
+                'company_id': result['company_id'],
+                'data_file_timestamped': result['s3_url_timestamped'],
+                'data_file_latest': result['s3_url_latest'],
+                'extraction_timestamp': result['extraction_timestamp'],
+                'export_timestamp': result['export_timestamp']
+            }
+            
+            logger.info(f"✅ Private company export completed for {company_name}")
+            
+        else:
+            # Standard merge mode (SEC + CXO)
+            company_id = None
+            if company_name:
+                # Convert to company_id format (same normalization as extractors)
+                company_id = company_name.lower().replace(' ', '_').replace('.', '').replace(',', '')
+                logger.info(f"Starting merge for specific company: {company_name} (ID: {company_id})")
+            else:
+                logger.info(f"Starting merge for ALL companies in S3 bucket: {s3_bucket_name}")
+            
+            # Run merge and save (with optional company_id filter)
+            result = merger.run(company_id)
+            
+            # Prepare response
+            response_body = {
+                'merge_status': 'success',
+                'total_companies': result['total_companies'],
+                'data_file': result['data_file'],
+                'latest_file': result['latest_file'],
+                'timestamp': result['timestamp']
+            }
+            
+            logger.info(f"✅ Merge completed: {result['total_companies']} companies")
         
         return {
             'statusCode': 200,
