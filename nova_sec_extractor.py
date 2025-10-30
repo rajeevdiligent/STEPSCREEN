@@ -41,13 +41,28 @@ class CompanyInfo:
     annual_revenue: str
     annual_sales: str
     website_url: str
+    subsidiaries: List[Dict[str, str]] = None  # List of subsidiary companies
 
 class NovaProExtractor:
     """Real Nova Pro integration for SEC document analysis"""
     
-    def __init__(self, profile: str = "diligent", region: str = "us-east-1"):
+    # Mapping of countries to their regulatory bodies (shared with NovaSECExtractor)
+    REGULATORY_BODIES = {
+        'india': {'name': 'Securities and Exchange Board of India (SEBI)'},
+        'uk': {'name': 'Companies House / Financial Conduct Authority'},
+        'canada': {'name': 'SEDAR'},
+        'australia': {'name': 'Australian Securities and Investments Commission (ASIC)'},
+        'singapore': {'name': 'ACRA / SGX'},
+        'japan': {'name': 'Financial Services Agency (FSA)'},
+        'china': {'name': 'China Securities Regulatory Commission (CSRC)'},
+        'germany': {'name': 'Federal Financial Supervisory Authority (BaFin)'},
+        'france': {'name': 'Autorité des marchés financiers (AMF)'}
+    }
+    
+    def __init__(self, profile: str = "diligent", region: str = "us-east-1", serper_api_key: str = None):
         self.profile = profile
         self.region = region
+        self.serper_api_key = serper_api_key or os.getenv('SERPER_API_KEY')
         
         try:
             # Check if running in Lambda environment
@@ -72,7 +87,42 @@ class NovaProExtractor:
             logger.error(f"Error initializing AWS Bedrock client: {e}")
             self.bedrock_client = None
     
-    def extract_company_data(self, company_name: str, document_urls: List[str], search_snippets: str = "") -> CompanyInfo:
+    def _is_us_location(self, location: str) -> bool:
+        """Determine if the location is in the United States"""
+        if not location:
+            return True
+        
+        location_lower = location.lower().strip()
+        us_indicators = ['us', 'usa', 'united states', 'u.s.', 'u.s.a.', 'america']
+        if any(indicator in location_lower for indicator in us_indicators):
+            return True
+        
+        # Check US states (abbreviated list)
+        us_states = ['alabama', 'alaska', 'arizona', 'arkansas', 'california', 'colorado', 'connecticut',
+                     'delaware', 'florida', 'georgia', 'hawaii', 'idaho', 'illinois', 'indiana', 'iowa',
+                     'kansas', 'kentucky', 'louisiana', 'maine', 'maryland', 'massachusetts', 'michigan',
+                     'minnesota', 'mississippi', 'missouri', 'montana', 'nebraska', 'nevada', 'new hampshire',
+                     'new jersey', 'new mexico', 'new york', 'north carolina', 'north dakota', 'ohio',
+                     'oklahoma', 'oregon', 'pennsylvania', 'rhode island', 'south carolina', 'south dakota',
+                     'tennessee', 'texas', 'utah', 'vermont', 'virginia', 'washington', 'west virginia',
+                     'wisconsin', 'wyoming']
+        
+        return any(state in location_lower for state in us_states)
+    
+    def _get_regulatory_info(self, location: str) -> Dict[str, Any]:
+        """Get regulatory body information for a given location"""
+        if not location:
+            return None
+        
+        location_lower = location.lower().strip()
+        
+        for country, info in self.REGULATORY_BODIES.items():
+            if country in location_lower:
+                return {'country': country.title(), 'regulatory_body': info['name']}
+        
+        return {'country': location, 'regulatory_body': 'Local Regulatory Authority'}
+    
+    def extract_company_data(self, company_name: str, document_urls: List[str], search_snippets: str = "", location: str = None) -> CompanyInfo:
         """
         Extract company information using Nova Pro following apple_sec_search.py approach
         """
@@ -82,7 +132,7 @@ class NovaProExtractor:
         
         try:
             # Build comprehensive prompt for Nova Pro
-            prompt = self._build_extraction_prompt(company_name, document_urls, search_snippets)
+            prompt = self._build_extraction_prompt(company_name, document_urls, search_snippets, location)
             
             # Call Nova Pro model
             model_id = "amazon.nova-pro-v1:0"
@@ -127,29 +177,49 @@ class NovaProExtractor:
             logger.error(f"Error with Nova Pro extraction: {e}")
             return self._enhanced_fallback_extraction(company_name, document_urls, search_snippets)
     
-    def _build_extraction_prompt(self, company_name: str, document_urls: List[str], search_snippets: str) -> str:
+    def _build_extraction_prompt(self, company_name: str, document_urls: List[str], search_snippets: str, location: str = None) -> str:
         """Build comprehensive extraction prompt for Nova Pro"""
         
-        # Extract CIK from URLs for context
+        # Determine if US or non-US company
+        is_us = self._is_us_location(location) if location else True
+        
+        # Extract CIK from URLs for context (only for US companies)
         cik = None
-        for url in document_urls:
-            cik_match = re.search(r'/data/(\d+)/', url)
-            if cik_match:
-                cik = cik_match.group(1).zfill(10)
-                break
+        if is_us:
+            for url in document_urls:
+                cik_match = re.search(r'/data/(\d+)/', url)
+                if cik_match:
+                    cik = cik_match.group(1).zfill(10)
+                    break
         
         current_year = datetime.now().year
+        location_info = f"\nLOCATION: {location}" if location else ""
+        
+        # Different prompts for US vs non-US companies
+        if is_us:
+            doc_type = "SEC 10-K/10-Q documents"
+            doc_description = f"the SEC {doc_type} at these URLs"
+            cik_info = f"\nCIK: {cik or 'Unknown'}"
+        else:
+            regulatory_info = self._get_regulatory_info(location)
+            if regulatory_info:
+                doc_type = f"regulatory filings from {regulatory_info['regulatory_body']}"
+            else:
+                doc_type = "corporate regulatory filings, annual reports, and financial statements"
+            doc_description = f"{doc_type} at these URLs"
+            cik_info = ""
+        
         prompt = f"""
-You are a financial data extraction expert specializing in SEC 10-K document analysis. 
+You are a financial data extraction expert specializing in corporate regulatory filings and financial documents. 
 
-COMPANY: {company_name}
-CIK: {cik or 'Unknown'}
+COMPANY: {company_name}{location_info}{cik_info}
 CURRENT YEAR: {current_year}
+DOCUMENT TYPE: {doc_type}
 
-TASK: Extract detailed company information from the SEC 10-K documents at these URLs (prioritized by recency):
+TASK: Extract detailed company information from {doc_description} (prioritized by recency):
 {chr(10).join(f"- {url}" for url in document_urls[:5])}
 
-SEARCH CONTEXT (from SEC document search - includes {current_year} documents):
+SEARCH CONTEXT (from regulatory document search - includes {current_year} documents):
 {search_snippets[:2000]}
 
 **🚨 CRITICAL INSTRUCTION: PRIORITIZE 2025 QUARTERLY DATA OVER 2024 ANNUAL DATA:**
@@ -199,7 +269,14 @@ Extract and return ONLY a JSON object with the following fields:
     "number_of_employees": "LATEST number of employees with date - search ALL documents for most recent count (prioritize 2025 data from any document type)",
     "annual_revenue": "LATEST revenue - USE 2025 quarterly data if available (format: '$X billion Q1 2025' or '$X billion fiscal 2025')",
     "annual_sales": "LATEST sales/net sales - USE 2025 quarterly data if available (format: '$X billion Q1 2025' or '$X billion fiscal 2025')",
-    "website_url": "company website URL"
+    "website_url": "company website URL",
+    "subsidiaries": [
+        {{
+            "name": "subsidiary legal name",
+            "location": "country/state of incorporation",
+            "description": "brief description of subsidiary business (optional)"
+        }}
+    ]
 }}
 
 EXTRACTION RULES:
@@ -219,6 +296,7 @@ EXTRACTION RULES:
 10. Use the exact legal name as it appears in SEC filings
 11. Provide concise business description covering activities, industries, and core products/services
 12. **MANDATORY: Extract ALL available company identifiers from both 2025 and 2024 documents**
+13. **SUBSIDIARIES EXTRACTION**: Look for Exhibit 21 or similar sections that list subsidiaries. Extract subsidiary name, location, and brief description if available. If no subsidiaries found, return empty array []
 
 Based on the SEC document URLs and search context provided, extract the company information and return the JSON object.
 """
@@ -233,6 +311,14 @@ Based on the SEC document URLs and search context provided, extract the company 
                 json_str = json_match.group()
                 data = json.loads(json_str)
                 
+                # Search for official website if not provided or if generic
+                website_url = data.get('website_url', '')
+                if not website_url or website_url == 'Not specified in SEC documents':
+                    if self.serper_api_key:
+                        website_url = self._search_company_website(company_name, self.serper_api_key)
+                    else:
+                        website_url = self._generate_website_url_fallback(company_name)
+                
                 return CompanyInfo(
                     registered_legal_name=data.get('registered_legal_name', company_name),
                     country_of_incorporation=data.get('country_of_incorporation', 'United States'),
@@ -243,7 +329,8 @@ Based on the SEC document URLs and search context provided, extract the company 
                     number_of_employees=data.get('number_of_employees', 'Not specified in SEC documents'),
                     annual_revenue=data.get('annual_revenue', 'Not specified in SEC documents'),
                     annual_sales=data.get('annual_sales', 'Not specified in SEC documents'),
-                    website_url=data.get('website_url', self._generate_website_url(company_name))
+                    website_url=website_url,
+                    subsidiaries=data.get('subsidiaries', [])
                 )
             else:
                 raise ValueError("No JSON found in Nova Pro response")
@@ -274,6 +361,12 @@ Based on the SEC document URLs and search context provided, extract the company 
         # Generate comprehensive business description
         business_desc = self._generate_business_description(company_name, search_snippets)
         
+        # Search for official website
+        if self.serper_api_key:
+            website_url = self._search_company_website(company_name, self.serper_api_key)
+        else:
+            website_url = self._generate_website_url_fallback(company_name)
+        
         return CompanyInfo(
             registered_legal_name=company_name,
             country_of_incorporation="United States",
@@ -289,7 +382,8 @@ Based on the SEC document URLs and search context provided, extract the company 
             number_of_employees=employees or "Not specified in SEC documents",
             annual_revenue=revenue or "Not specified in SEC documents",
             annual_sales=revenue or "Not specified in SEC documents",
-            website_url=self._generate_website_url(company_name)
+            website_url=website_url,
+            subsidiaries=[]
         )
     
     def _extract_revenue_from_snippets(self, text: str) -> Optional[str]:
@@ -406,8 +500,84 @@ Based on the SEC document URLs and search context provided, extract the company 
         
         return f"{company_name} - Business information extracted from SEC 10-K filings and search results."
     
-    def _generate_website_url(self, company_name: str) -> str:
-        """Generate website URL from company name"""
+    def _search_company_website(self, company_name: str, serper_api_key: str) -> str:
+        """
+        Search for the company's official global corporate website using Serper API
+        Returns the official website URL or a generated fallback
+        """
+        try:
+            # Build search query for official website
+            query = f"{company_name} official website corporate global"
+            
+            headers = {
+                'X-API-KEY': serper_api_key,
+                'Content-Type': 'application/json'
+            }
+            
+            payload = {
+                'q': query,
+                'num': 5,
+                'gl': 'us',
+                'hl': 'en'
+            }
+            
+            logger.info(f"🔍 Searching for official website: {company_name}")
+            
+            response = requests.post("https://google.serper.dev/search", headers=headers, json=payload)
+            response.raise_for_status()
+            
+            results = response.json()
+            
+            # Look through organic results for official website
+            for result in results.get('organic', [])[:5]:
+                url = result.get('link', '')
+                title = result.get('title', '').lower()
+                snippet = result.get('snippet', '').lower()
+                
+                # Check if this is likely the official website
+                is_official = any(keyword in title or keyword in snippet 
+                                for keyword in ['official', 'corporate', 'investor relations', 'about us'])
+                
+                # Exclude job sites, social media, news, and review sites
+                excluded_domains = [
+                    'linkedin.com', 'facebook.com', 'twitter.com', 'instagram.com',
+                    'youtube.com', 'wikipedia.org', 'glassdoor.com', 'indeed.com',
+                    'news', 'blog', 'press', '/careers/', '/jobs/'
+                ]
+                
+                is_excluded = any(domain in url.lower() for domain in excluded_domains)
+                
+                # Check if company name is in domain
+                company_keywords = company_name.lower().replace(' ', '').replace('inc', '').replace('corp', '').replace('corporation', '').replace('.', '').replace(',', '')
+                is_company_domain = company_keywords[:10] in url.lower().replace('-', '').replace('.', '')
+                
+                if not is_excluded and (is_official or is_company_domain):
+                    logger.info(f"✅ Found official website: {url}")
+                    return url
+            
+            # If no good match found, return first non-excluded result
+            for result in results.get('organic', [])[:3]:
+                url = result.get('link', '')
+                excluded_domains = [
+                    'linkedin.com', 'facebook.com', 'twitter.com', 'instagram.com',
+                    'youtube.com', 'wikipedia.org', 'glassdoor.com', 'indeed.com'
+                ]
+                is_excluded = any(domain in url.lower() for domain in excluded_domains)
+                
+                if not is_excluded:
+                    logger.info(f"✅ Using website: {url}")
+                    return url
+            
+            # Fallback to generated URL
+            logger.warning(f"⚠️  Could not find official website, using generated fallback")
+            return self._generate_website_url_fallback(company_name)
+            
+        except Exception as e:
+            logger.error(f"Error searching for website: {e}")
+            return self._generate_website_url_fallback(company_name)
+    
+    def _generate_website_url_fallback(self, company_name: str) -> str:
+        """Generate website URL from company name as fallback"""
         clean_name = company_name.lower()
         clean_name = re.sub(r'\s+(inc|corp|corporation|company|co|ltd)\.?$', '', clean_name)
         clean_name = clean_name.replace(' ', '').replace('.', '').replace(',', '')
@@ -430,18 +600,139 @@ Based on the SEC document URLs and search context provided, extract the company 
 class NovaSECExtractor:
     """Main class following apple_sec_search.py approach with Nova Pro integration"""
     
+    # Mapping of countries to their regulatory bodies
+    REGULATORY_BODIES = {
+        'india': {
+            'name': 'Securities and Exchange Board of India (SEBI)',
+            'sites': ['sebi.gov.in', 'bseindia.com', 'nseindia.com'],
+            'filing_types': ['annual report', 'financial statement', 'quarterly results']
+        },
+        'uk': {
+            'name': 'Companies House / Financial Conduct Authority',
+            'sites': ['companieshouse.gov.uk', 'fca.org.uk'],
+            'filing_types': ['annual report', 'accounts', 'financial statements']
+        },
+        'canada': {
+            'name': 'SEDAR (System for Electronic Document Analysis and Retrieval)',
+            'sites': ['sedarplus.ca', 'sedar.com'],
+            'filing_types': ['annual report', 'financial statements']
+        },
+        'australia': {
+            'name': 'Australian Securities and Investments Commission (ASIC)',
+            'sites': ['asic.gov.au'],
+            'filing_types': ['annual report', 'financial statements']
+        },
+        'singapore': {
+            'name': 'Accounting and Corporate Regulatory Authority (ACRA)',
+            'sites': ['acra.gov.sg', 'sgx.com'],
+            'filing_types': ['annual report', 'financial statements']
+        },
+        'japan': {
+            'name': 'Financial Services Agency (FSA)',
+            'sites': ['fsa.go.jp', 'jpx.co.jp'],
+            'filing_types': ['annual report', '有価証券報告書']
+        },
+        'china': {
+            'name': 'China Securities Regulatory Commission (CSRC)',
+            'sites': ['csrc.gov.cn', 'sse.com.cn', 'szse.cn'],
+            'filing_types': ['annual report', 'financial statements']
+        },
+        'germany': {
+            'name': 'Federal Financial Supervisory Authority (BaFin)',
+            'sites': ['bundesanzeiger.de', 'bafin.de'],
+            'filing_types': ['annual report', 'financial statements']
+        },
+        'france': {
+            'name': 'Autorité des marchés financiers (AMF)',
+            'sites': ['amf-france.org'],
+            'filing_types': ['annual report', 'financial statements']
+        }
+    }
+    
     def __init__(self):
         self.serper_api_key = os.getenv('SERPER_API_KEY')
         if not self.serper_api_key:
             raise ValueError("SERPER_API_KEY not found in environment variables")
         
-        self.nova_extractor = NovaProExtractor(profile="diligent")
+        self.nova_extractor = NovaProExtractor(profile="diligent", serper_api_key=self.serper_api_key)
     
     def _get_search_years(self) -> tuple[str, str]:
         """Get current year and previous year for SEC document search"""
         current_year = datetime.now().year
         previous_year = current_year - 1
         return str(current_year), str(previous_year)
+    
+    def _is_us_location(self, location: str) -> bool:
+        """
+        Determine if the location is in the United States
+        
+        Args:
+            location: Location string (could be state, country, or None)
+            
+        Returns:
+            True if location is US or US state, False otherwise
+        """
+        if not location:
+            return True  # Default to US if no location specified
+        
+        location_lower = location.lower().strip()
+        
+        # US country indicators
+        us_indicators = ['us', 'usa', 'united states', 'u.s.', 'u.s.a.', 'america']
+        if any(indicator in location_lower for indicator in us_indicators):
+            return True
+        
+        # US state names and abbreviations
+        us_states = [
+            'alabama', 'alaska', 'arizona', 'arkansas', 'california', 'colorado', 'connecticut',
+            'delaware', 'florida', 'georgia', 'hawaii', 'idaho', 'illinois', 'indiana', 'iowa',
+            'kansas', 'kentucky', 'louisiana', 'maine', 'maryland', 'massachusetts', 'michigan',
+            'minnesota', 'mississippi', 'missouri', 'montana', 'nebraska', 'nevada', 'new hampshire',
+            'new jersey', 'new mexico', 'new york', 'north carolina', 'north dakota', 'ohio',
+            'oklahoma', 'oregon', 'pennsylvania', 'rhode island', 'south carolina', 'south dakota',
+            'tennessee', 'texas', 'utah', 'vermont', 'virginia', 'washington', 'west virginia',
+            'wisconsin', 'wyoming'
+        ]
+        
+        # Check if location matches any US state
+        for state in us_states:
+            if state in location_lower:
+                return True
+        
+        return False
+    
+    def _get_regulatory_info(self, location: str) -> Dict[str, Any]:
+        """
+        Get regulatory body information for a given location
+        
+        Args:
+            location: Country or location string
+            
+        Returns:
+            Dictionary with regulatory body info, or None if not found
+        """
+        if not location:
+            return None
+        
+        location_lower = location.lower().strip()
+        
+        # Check each country in our regulatory bodies mapping
+        for country, info in self.REGULATORY_BODIES.items():
+            if country in location_lower:
+                return {
+                    'country': country.title(),
+                    'regulatory_body': info['name'],
+                    'sites': info['sites'],
+                    'filing_types': info['filing_types']
+                }
+        
+        # If no specific match, return generic international search
+        return {
+            'country': location,
+            'regulatory_body': 'Local Regulatory Authority',
+            'sites': [],
+            'filing_types': ['annual report', 'financial statements', 'corporate filings']
+        }
     
     def _calculate_completeness(self, company_info: Dict[str, Any]) -> float:
         """
@@ -494,10 +785,17 @@ class NovaSECExtractor:
         completeness = (filled_fields / total_fields) * 100
         return round(completeness, 2)
     
-    def search_and_extract(self, company_name: str, stock_symbol: str = None, year: str = None, max_retries: int = 2) -> Dict[str, Any]:
+    def search_and_extract(self, company_name: str, stock_symbol: str = None, year: str = None, location: str = None, max_retries: int = 2) -> Dict[str, Any]:
         """
         Main method following apple_sec_search.py approach with Nova Pro
         Includes automatic retry logic if data completeness is below 95%
+        
+        Args:
+            company_name: Name of the company to extract
+            stock_symbol: Optional stock symbol
+            year: Year or year range to search (defaults to current and previous year)
+            location: Optional location/country of the company (enhances search accuracy)
+            max_retries: Maximum number of retry attempts
         """
         attempt = 0
         best_result = None
@@ -516,10 +814,11 @@ class NovaSECExtractor:
                         logger.info(f"Using dynamic years: {current_year} (current) and {previous_year} (previous)")
                 
                 if attempt == 0:
-                    logger.info(f"Starting Nova Pro SEC data extraction for: {company_name}")
+                    location_info = f" (Location: {location})" if location else ""
+                    logger.info(f"Starting Nova Pro SEC data extraction for: {company_name}{location_info}")
                 
                 # Step 1: Search for SEC documents (following apple_sec_search.py)
-                search_results = self._search_sec_documents(company_name, year, current_year, previous_year)
+                search_results = self._search_sec_documents(company_name, year, current_year, previous_year, location)
                 
                 if not search_results.get('organic'):
                     return self._create_empty_result(company_name, "No search results found")
@@ -537,7 +836,7 @@ class NovaSECExtractor:
                 
                 # Step 4: Extract data using Nova Pro (following apple_sec_search.py)
                 company_data = self.nova_extractor.extract_company_data(
-                    company_name, document_urls, search_snippets
+                    company_name, document_urls, search_snippets, location=location
                 )
                 
                 # Step 5: Compile results (apple_sec_search.py format)
@@ -600,11 +899,42 @@ class NovaSECExtractor:
             return best_result
         return self._create_empty_result(company_name, "Unknown error occurred")
     
-    def _search_sec_documents(self, company_name: str, year: str, current_year: str, previous_year: str) -> Dict[str, Any]:
-        """Search for SEC documents (apple_sec_search.py approach)"""
+    def _search_sec_documents(self, company_name: str, year: str, current_year: str, previous_year: str, location: str = None) -> Dict[str, Any]:
+        """
+        Search for regulatory documents (SEC for US, local regulatory bodies for non-US)
+        
+        Args:
+            company_name: Name of the company
+            year: Year or year range to search
+            current_year: Current year
+            previous_year: Previous year
+            location: Optional location/country to refine search
+        """
         try:
-            # Enhanced query to include latest quarterly reports and earnings data
-            query = f"{company_name} site:sec.gov (10-K OR 10-Q OR 8-K) ({year}) (earnings OR quarterly OR annual) filetype:htm OR filetype:html"
+            # Check if location is US or non-US
+            is_us = self._is_us_location(location)
+            
+            if is_us:
+                # US company - search SEC
+                location_filter = f" {location}" if location else ""
+                query = f"{company_name}{location_filter} site:sec.gov (10-K OR 10-Q OR 8-K) ({year}) (earnings OR quarterly OR annual) filetype:htm OR filetype:html"
+                logger.info(f"🇺🇸 US Company - Searching SEC for latest {year} documents: {query}")
+            else:
+                # Non-US company - search local regulatory bodies
+                regulatory_info = self._get_regulatory_info(location)
+                
+                if regulatory_info and regulatory_info.get('sites'):
+                    # Build query for local regulatory sites
+                    sites_query = ' OR '.join([f'site:{site}' for site in regulatory_info['sites']])
+                    filing_types = ' OR '.join([f'"{ft}"' for ft in regulatory_info['filing_types']])
+                    query = f"{company_name} ({sites_query}) ({filing_types}) ({year})"
+                    logger.info(f"🌍 Non-US Company ({regulatory_info['country']}) - Searching {regulatory_info['regulatory_body']}")
+                else:
+                    # Generic international search
+                    query = f'"{company_name}" {location} ("annual report" OR "financial statements" OR "investor relations") ({year}) filetype:pdf'
+                    logger.info(f"🌍 International Company - Searching for corporate filings: {query}")
+                
+                logger.info(f"Search query: {query}")
             
             headers = {
                 'X-API-KEY': self.serper_api_key,
@@ -619,8 +949,6 @@ class NovaSECExtractor:
                 'tbs': 'qdr:y'
             }
             
-            logger.info(f"Searching for latest {year} 10-K documents: {query}")
-            
             response = requests.post("https://google.serper.dev/search", headers=headers, json=payload)
             response.raise_for_status()
             
@@ -630,7 +958,7 @@ class NovaSECExtractor:
             return results
             
         except Exception as e:
-            logger.error(f"Error searching SEC documents: {e}")
+            logger.error(f"Error searching regulatory documents: {e}")
             return {}
     
     def _prioritize_sec_documents(self, search_results: Dict, company_name: str, stock_symbol: str, year: str, current_year: str, previous_year: str) -> tuple:
@@ -829,6 +1157,7 @@ class NovaSECExtractor:
                 'annual_revenue': company_info.get('annual_revenue', ''),
                 'annual_sales': company_info.get('annual_sales', ''),
                 'website_url': company_info.get('website_url', ''),
+                'subsidiaries': company_info.get('subsidiaries', []),
                 'extraction_source': 'nova_sec_extractor'
             }
             
@@ -882,6 +1211,17 @@ class NovaSECExtractor:
         print(f"\nBUSINESS DESCRIPTION:")
         print(company_info.get('business_description', 'N/A'))
         
+        # Display subsidiaries if available
+        subsidiaries = company_info.get('subsidiaries', [])
+        if subsidiaries:
+            print(f"\nSUBSIDIARIES ({len(subsidiaries)} found):")
+            for i, sub in enumerate(subsidiaries[:10], 1):  # Show first 10
+                print(f"{i}. {sub.get('name', 'N/A')}")
+                if sub.get('location'):
+                    print(f"   Location: {sub['location']}")
+                if sub.get('description'):
+                    print(f"   Description: {sub['description']}")
+        
         print(f"\nSEARCH SUMMARY:")
         print(f"Search Focus: {result.get('search_focus', 'SEC Documents')}")
         print(f"Total Results: {result.get('total_results', 0)}")
@@ -915,22 +1255,26 @@ class NovaSECExtractor:
 
 def main():
     """Main function"""
-    if len(sys.argv) != 2:
-        print("Usage: python nova_sec_extractor.py \"Company Name\"")
+    # Support both old format (company name only) and new format (company name + location)
+    if len(sys.argv) < 2 or len(sys.argv) > 3:
+        print("Usage: python nova_sec_extractor.py \"Company Name\" [\"Location\"]")
         print("\nExamples:")
+        print("  python nova_sec_extractor.py \"Apple Inc\" \"United States\"")
+        print("  python nova_sec_extractor.py \"Microsoft Corporation\" \"Washington\"")
+        print("  python nova_sec_extractor.py \"Tesla Inc\" \"Texas, USA\"")
+        print("\n  Backwards compatible (location optional):")
         print("  python nova_sec_extractor.py \"Apple Inc\"")
-        print("  python nova_sec_extractor.py \"Microsoft Corporation\"")
-        print("  python nova_sec_extractor.py \"Tesla Inc\"")
         return
     
     company_name = sys.argv[1]
+    location = sys.argv[2] if len(sys.argv) == 3 else None
     
     try:
         # Initialize the Nova SEC extractor
         extractor = NovaSECExtractor()
         
         # Extract company data using Nova Pro
-        result = extractor.search_and_extract(company_name)
+        result = extractor.search_and_extract(company_name, location=location)
         
         # Display results
         extractor.display_results(result)

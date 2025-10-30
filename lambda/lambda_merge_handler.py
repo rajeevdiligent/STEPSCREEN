@@ -7,10 +7,18 @@ import json
 import boto3
 from datetime import datetime
 import logging
+from decimal import Decimal
 
 # Configure logging for Lambda
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
+
+class DecimalEncoder(json.JSONEncoder):
+    """Helper class to convert Decimal to float for JSON serialization"""
+    def default(self, obj):
+        if isinstance(obj, Decimal):
+            return float(obj)
+        return super(DecimalEncoder, self).default(obj)
 
 class DynamoDBS3Merger:
     def __init__(self, s3_bucket_name: str, region_name: str = 'us-east-1'):
@@ -25,6 +33,8 @@ class DynamoDBS3Merger:
         self.sec_table_name = 'CompanySECData'
         self.cxo_table_name = 'CompanyCXOData'
         self.private_table_name = 'CompanyPrivateData'
+        self.adverse_table_name = 'CompanyAdverseMedia'
+        self.sanctions_table_name = 'CompanySanctionsScreening'
 
     def _scan_table(self, table_name: str) -> list:
         """Scans a DynamoDB table and returns all items."""
@@ -46,7 +56,7 @@ class DynamoDBS3Merger:
         return response['Items']
 
     def extract_data(self, company_id: str = None):
-        """Extracts data from both DynamoDB tables.
+        """Extracts data from all DynamoDB tables (SEC, CXO, Adverse Media, Sanctions).
         
         Args:
             company_id: Optional. If provided, only extract data for this specific company.
@@ -65,6 +75,20 @@ class DynamoDBS3Merger:
             logger.info(f"👥 Extracting CXO data for company: {company_id}...")
             cxo_data = self._query_by_company_id(self.cxo_table_name, company_id)
             logger.info(f"✅ Extracted {len(cxo_data)} executives for {company_id}")
+            
+            logger.info(f"⚠️  Extracting Adverse Media data for company: {company_id}...")
+            adverse_data = self._query_by_company_id(self.adverse_table_name, company_id)
+            logger.info(f"✅ Extracted {len(adverse_data)} adverse media items for {company_id}")
+            
+            logger.info(f"🛡️  Extracting Sanctions Screening data for company: {company_id}...")
+            sanctions_data = self._query_by_company_id(self.sanctions_table_name, company_id)
+            if sanctions_data:
+                # Get only the most recent screening
+                sanctions_data = [max(sanctions_data, key=lambda x: x['screening_timestamp'])]
+                logger.info(f"✅ Extracted sanctions screening for {company_id}")
+            else:
+                logger.info(f"ℹ️  No sanctions screening data found for {company_id}")
+                sanctions_data = []
         else:
             logger.info("📊 Extracting SEC data for ALL companies from DynamoDB...")
             sec_data = self._scan_table(self.sec_table_name)
@@ -73,18 +97,32 @@ class DynamoDBS3Merger:
             logger.info("👥 Extracting CXO data for ALL companies from DynamoDB...")
             cxo_data = self._scan_table(self.cxo_table_name)
             logger.info(f"✅ Extracted {len(cxo_data)} executives from {len(set(item['company_id'] for item in cxo_data))} companies")
+            
+            logger.info("⚠️  Extracting Adverse Media data for ALL companies from DynamoDB...")
+            adverse_data = self._scan_table(self.adverse_table_name)
+            logger.info(f"✅ Extracted {len(adverse_data)} adverse media items from {len(set(item['company_id'] for item in adverse_data))} companies")
+            
+            logger.info("🛡️  Extracting Sanctions Screening data for ALL companies from DynamoDB...")
+            sanctions_data = self._scan_table(self.sanctions_table_name)
+            logger.info(f"✅ Extracted {len(sanctions_data)} sanctions screenings from {len(set(item['company_id'] for item in sanctions_data))} companies")
         
-        return sec_data, cxo_data
+        return sec_data, cxo_data, adverse_data, sanctions_data
 
-    def merge_data(self, sec_data: list, cxo_data: list) -> dict:
-        """Merges SEC and CXO data by company_id."""
+    def merge_data(self, sec_data: list, cxo_data: list, adverse_data: list, sanctions_data: list) -> dict:
+        """Merges SEC, CXO, Adverse Media, and Sanctions data by company_id."""
         merged_data = {}
 
         # Process SEC data
         for item in sec_data:
             company_id = item['company_id']
             if company_id not in merged_data:
-                merged_data[company_id] = {'company_id': company_id, 'sec_data': {}, 'executives': []}
+                merged_data[company_id] = {
+                    'company_id': company_id,
+                    'sec_data': {},
+                    'executives': [],
+                    'adverse_media': [],
+                    'sanctions_screening': {}
+                }
             
             # Keep the most recent SEC data for each company_id
             current_timestamp = item['extraction_timestamp']
@@ -100,11 +138,54 @@ class DynamoDBS3Merger:
         for item in cxo_data:
             company_id = item['company_id']
             if company_id not in merged_data:
-                merged_data[company_id] = {'company_id': company_id, 'sec_data': {}, 'executives': []}
+                merged_data[company_id] = {
+                    'company_id': company_id,
+                    'sec_data': {},
+                    'executives': [],
+                    'adverse_media': [],
+                    'sanctions_screening': {}
+                }
             
             # Remove DynamoDB-specific keys before storing
             executive_info = {k: v for k, v in item.items() if k not in ['company_id', 'executive_id', 'extraction_timestamp', 'company_name', 'company_website']}
             merged_data[company_id]['executives'].append(executive_info)
+        
+        # Process Adverse Media data
+        for item in adverse_data:
+            company_id = item['company_id']
+            if company_id not in merged_data:
+                merged_data[company_id] = {
+                    'company_id': company_id,
+                    'sec_data': {},
+                    'executives': [],
+                    'adverse_media': [],
+                    'sanctions_screening': {}
+                }
+            
+            # Remove DynamoDB-specific keys before storing
+            adverse_info = {k: v for k, v in item.items() if k not in ['company_id', 'adverse_id']}
+            merged_data[company_id]['adverse_media'].append(adverse_info)
+        
+        # Process Sanctions Screening data
+        for item in sanctions_data:
+            company_id = item['company_id']
+            if company_id not in merged_data:
+                merged_data[company_id] = {
+                    'company_id': company_id,
+                    'sec_data': {},
+                    'executives': [],
+                    'adverse_media': [],
+                    'sanctions_screening': {}
+                }
+            
+            # Keep the most recent sanctions screening
+            current_timestamp = item.get('screening_timestamp', '')
+            existing_timestamp = merged_data[company_id]['sanctions_screening'].get('screening_timestamp', '')
+            
+            if current_timestamp > existing_timestamp:
+                # Remove DynamoDB-specific keys before storing
+                sanctions_info = {k: v for k, v in item.items() if k not in ['company_id', 'screening_id']}
+                merged_data[company_id]['sanctions_screening'] = sanctions_info
         
         # Clean up extraction_timestamp from sec_data before final output
         for company_id in merged_data:
@@ -120,7 +201,7 @@ class DynamoDBS3Merger:
             self.s3_client.put_object(
                 Bucket=self.s3_bucket_name,
                 Key=key,
-                Body=json.dumps(data, indent=2, ensure_ascii=False),
+                Body=json.dumps(data, indent=2, ensure_ascii=False, cls=DecimalEncoder),
                 ContentType='application/json'
             )
             logger.info(f"✅ Data saved to S3: s3://{self.s3_bucket_name}/{key}")
@@ -141,8 +222,8 @@ class DynamoDBS3Merger:
             logger.info("DynamoDB to S3 Data Merger - All Companies")
         logger.info("======================================================================")
         
-        sec_data, cxo_data = self.extract_data(company_id)
-        merged_data = self.merge_data(sec_data, cxo_data)
+        sec_data, cxo_data, adverse_data, sanctions_data = self.extract_data(company_id)
+        merged_data = self.merge_data(sec_data, cxo_data, adverse_data, sanctions_data)
         
         logger.info(f"💾 Saving merged data to S3 bucket: {self.s3_bucket_name}")
         
@@ -228,7 +309,7 @@ class DynamoDBS3Merger:
                     output_data['private_company_data'][key] = value
         
         # Save to S3
-        json_data = json.dumps(output_data, indent=2, ensure_ascii=False)
+        json_data = json.dumps(output_data, indent=2, ensure_ascii=False, cls=DecimalEncoder)
         
         # File naming: private_company_data/{company_name}_{timestamp}.json
         safe_company_name = company_name.lower().replace(' ', '_').replace('.', '').replace(',', '')
@@ -294,7 +375,7 @@ def lambda_handler(event, context):
     AWS Lambda handler for DynamoDB to S3 merger
     
     Event format:
-    Standard Merge (SEC + CXO):
+    Standard Merge (SEC + CXO + Adverse Media + Sanctions):
     {
         "s3_bucket_name": "company-sec-cxo-data-diligent",
         "company_name": "Apple Inc" (optional - if provided, only merge this company)
@@ -405,7 +486,7 @@ def lambda_handler(event, context):
         
         return {
             'statusCode': 200,
-            'body': json.dumps(response_body, default=str)
+            'body': json.dumps(response_body, cls=DecimalEncoder, default=str)
         }
         
     except Exception as e:
@@ -415,7 +496,7 @@ def lambda_handler(event, context):
             'body': json.dumps({
                 'error': 'Internal server error',
                 'message': str(e)
-            })
+            }, cls=DecimalEncoder)
         }
 
 

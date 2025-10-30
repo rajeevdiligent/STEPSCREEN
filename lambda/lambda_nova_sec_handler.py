@@ -88,9 +88,15 @@ def lambda_handler(event, context):
         company_info = result.get('company_information', {})
         completeness = extractor._calculate_completeness(company_info)
         
+        # Generate company_id (same logic as DynamoDB save)
+        company_id = company_name.lower().replace(' ', '_').replace('.', '').replace(',', '')
+        website_url = company_info.get('website_url', '')
+        
         # Prepare response
         response_body = {
             'company_name': company_name,
+            'company_id': company_id,
+            'website_url': website_url,
             'extraction_status': 'success',
             'completeness': completeness,
             'extraction_timestamp': result.get('search_timestamp'),

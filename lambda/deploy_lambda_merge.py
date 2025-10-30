@@ -147,6 +147,11 @@ def deploy_lambda_function(lambda_client, iam_client, zip_path):
         )
         print(f"   ✅ Updated existing Lambda function")
         
+        # Wait for function code update to complete
+        print(f"   ⏳ Waiting for code update to complete...")
+        waiter = lambda_client.get_waiter('function_updated_v2')
+        waiter.wait(FunctionName=LAMBDA_FUNCTION_NAME, WaiterConfig={'MaxAttempts': 60, 'Delay': 2})
+        
         # Update configuration
         lambda_client.update_function_configuration(
             FunctionName=LAMBDA_FUNCTION_NAME,
@@ -155,6 +160,7 @@ def deploy_lambda_function(lambda_client, iam_client, zip_path):
             MemorySize=LAMBDA_MEMORY,
             Environment=environment
         )
+        print(f"   ✅ Updated function configuration")
         
     except lambda_client.exceptions.ResourceNotFoundException:
         # Create new function

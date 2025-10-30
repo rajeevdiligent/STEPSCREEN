@@ -62,7 +62,7 @@ def delete_all_items(table_name: str, profile_name: str = 'diligent', region_nam
 
 
 def main():
-    """Main function to clear both DynamoDB tables"""
+    """Main function to clear all DynamoDB tables"""
     
     print("=" * 70)
     print("DynamoDB Tables Data Cleanup")
@@ -75,6 +75,9 @@ def main():
     print("\n⚠️  WARNING: This will delete ALL data from the following tables:")
     print("   - CompanySECData")
     print("   - CompanyCXOData")
+    print("   - CompanyPrivateData")
+    print("   - CompanyAdverseMedia")
+    print("   - CompanySanctionsScreening")
     print("\nThis action cannot be undone!")
     
     if not skip_confirmation:
@@ -100,13 +103,28 @@ def main():
     print("\n2️⃣  Clearing CXO Executive Data Table...")
     cxo_deleted = delete_all_items('CompanyCXOData', profile_name, region_name)
     
+    # Clear CompanyPrivateData table
+    print("\n3️⃣  Clearing Private Company Data Table...")
+    private_deleted = delete_all_items('CompanyPrivateData', profile_name, region_name)
+    
+    # Clear CompanyAdverseMedia table
+    print("\n4️⃣  Clearing Adverse Media Data Table...")
+    adverse_deleted = delete_all_items('CompanyAdverseMedia', profile_name, region_name)
+    
+    # Clear CompanySanctionsScreening table
+    print("\n5️⃣  Clearing Sanctions Screening Data Table...")
+    sanctions_deleted = delete_all_items('CompanySanctionsScreening', profile_name, region_name)
+    
     print("\n" + "=" * 70)
     print("Cleanup Complete!")
     print("=" * 70)
     print(f"\n📊 Summary:")
     print(f"   CompanySECData: {sec_deleted} items deleted")
     print(f"   CompanyCXOData: {cxo_deleted} items deleted")
-    print(f"   Total: {sec_deleted + cxo_deleted} items deleted")
+    print(f"   CompanyPrivateData: {private_deleted} items deleted")
+    print(f"   CompanyAdverseMedia: {adverse_deleted} items deleted")
+    print(f"   CompanySanctionsScreening: {sanctions_deleted} items deleted")
+    print(f"   Total: {sec_deleted + cxo_deleted + private_deleted + adverse_deleted + sanctions_deleted} items deleted")
     print("\n✅ All tables are now empty and ready for new data")
     print("=" * 70)
 

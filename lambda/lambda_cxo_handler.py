@@ -8,6 +8,7 @@ import os
 import sys
 from datetime import datetime
 import logging
+import boto3
 
 # Configure logging for Lambda
 logger = logging.getLogger()
@@ -15,6 +16,51 @@ logger.setLevel(logging.INFO)
 
 # Import the main extractor class
 from cxo_website_extractor import SerperCxOSearcher, CxOResultsFormatter
+
+def get_website_from_dynamodb(company_name, aws_profile=None):
+    """Query DynamoDB to get website_url for a company"""
+    try:
+        if aws_profile:
+            session = boto3.Session(profile_name=aws_profile)
+            dynamodb = session.client('dynamodb', region_name='us-east-1')
+        else:
+            dynamodb = boto3.client('dynamodb', region_name='us-east-1')
+        
+        # Normalize company name to match company_id format (lowercase, simplified)
+        # Try multiple variations
+        company_ids_to_try = [
+            company_name.lower().replace(' ', '').replace(',', '').replace('.', '').replace('inc', '').replace('corp', '').replace('corporation', '').strip(),
+            company_name.lower().split()[0],  # First word
+            company_name.lower().replace(' ', ''),  # No spaces
+        ]
+        
+        for company_id in company_ids_to_try:
+            # Query CompanySECData table for the most recent entry
+            response = dynamodb.query(
+                TableName='CompanySECData',
+                KeyConditionExpression='company_id = :company_id',
+                ExpressionAttributeValues={
+                    ':company_id': {'S': company_id}
+                },
+                ScanIndexForward=False,  # Sort descending by timestamp
+                Limit=1
+            )
+            
+            if response['Items']:
+                item = response['Items'][0]
+                
+                # Website URL is stored as a top-level field
+                if 'website_url' in item and 'S' in item['website_url']:
+                    website_url = item['website_url']['S']
+                    logger.info(f"Retrieved website_url from DynamoDB using company_id '{company_id}': {website_url}")
+                    return website_url
+        
+        logger.warning(f"No SEC data found in DynamoDB for {company_name} (tried: {company_ids_to_try})")
+        return None
+            
+    except Exception as e:
+        logger.error(f"Error querying DynamoDB: {e}")
+        return None
 
 def lambda_handler(event, context):
     """
@@ -44,7 +90,14 @@ def lambda_handler(event, context):
         if isinstance(event, str):
             event = json.loads(event)
         
+        company_name = event.get('company_name')
         website_url = event.get('website_url')
+        
+        # If website_url not provided, try to get it from DynamoDB
+        if not website_url and company_name:
+            logger.info(f"website_url not provided, querying DynamoDB for {company_name}")
+            website_url = get_website_from_dynamodb(company_name)
+        
         if not website_url:
             return {
                 'statusCode': 400,

@@ -42,10 +42,14 @@ def create_deployment_package():
     print("   ✅ Dependencies installed")
     
     print("\n2. Copying application files...")
-    # Copy main extractor
-    shutil.copy2("nova_sec_extractor.py", package_dir / "nova_sec_extractor.py")
-    # Copy Lambda handler
-    shutil.copy2("lambda_nova_sec_handler.py", package_dir / "lambda_handler.py")
+    # Get script directory and parent directory
+    script_dir = Path(__file__).parent
+    parent_dir = script_dir.parent
+    
+    # Copy main extractor from parent directory
+    shutil.copy2(parent_dir / "nova_sec_extractor.py", package_dir / "nova_sec_extractor.py")
+    # Copy Lambda handler from current directory
+    shutil.copy2(script_dir / "lambda_nova_sec_handler.py", package_dir / "lambda_handler.py")
     print("   ✅ Application files copied")
     
     print("\n3. Creating deployment package...")

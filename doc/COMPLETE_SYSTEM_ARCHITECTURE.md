@@ -10,8 +10,8 @@ STEPSCREEN is a serverless data extraction platform that extracts company inform
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                           STEPSCREEN PLATFORM                                │
-│                    Company Data Extraction System                            │
+│                           STEPSCREEN PLATFORM                               │
+│                    Company Data Extraction System                           │
 └─────────────────────────────────────────────────────────────────────────────┘
 
                                     ▼
@@ -30,7 +30,7 @@ STEPSCREEN is a serverless data extraction platform that extracts company inform
     │ (Step Function)           │   │ (Step Function)               │
     └───────────────────────────┘   └───────────────────────────────┘
                     │                               │
-            ┌───────┴───────┐                      │
+            ┌───────┴───────┐                       │
             │               │                       │
             ▼               ▼                       ▼
     ┌─────────────┐ ┌─────────────┐       ┌─────────────────┐
